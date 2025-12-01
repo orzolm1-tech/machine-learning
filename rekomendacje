@@ -1,0 +1,368 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from surprise import Dataset, Reader, SVD, KNNWithMeans
+from surprise.model_selection import cross_validate, GridSearchCV
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+def load_ratings(ratings_path: str) -> pd.DataFrame:
+
+    col_names = ["user_id", "movie_id", "rating", "timestamp"]
+    ratings = pd.read_csv(
+        ratings_path,
+        sep="\t",
+        header=None,
+        names=col_names,
+        engine="python"
+    )
+    return ratings
+
+
+def load_movies(items_path: str) -> pd.DataFrame:
+
+    movie_cols = [
+        "movie_id", "title", "release_date", "video_release_date", "imdb_url",
+        "unknown", "Action", "Adventure", "Animation", "Children", "Comedy",
+        "Crime", "Documentary", "Drama", "Fantasy", "Film-Noir", "Horror",
+        "Musical", "Mystery", "Romance", "Sci-Fi", "Thriller", "War", "Western"
+    ]
+
+    movies = pd.read_csv(
+        items_path,
+        sep="|",
+        header=None,
+        names=movie_cols,
+        encoding="latin-1",
+        engine="python"
+    )
+
+    movies["year"] = (
+        movies["release_date"]
+        .astype(str)
+        .str.extract(r"(\d{4})", expand=False)
+        .astype("Int64")
+    )
+
+    return movies
+
+#analiza danych
+def count_sci_fi_movies(movies: pd.DataFrame) -> int:
+
+    return int((movies["Sci-Fi"] == 1).sum())
+
+
+def comedy_distribution(ratings: pd.DataFrame, movies: pd.DataFrame) -> pd.DataFrame:
+
+    merged = ratings.merge(
+        movies[["movie_id", "title", "Comedy"]],
+        on="movie_id",
+        how="left"
+    )
+
+    comedy = merged[merged["Comedy"] == 1]
+
+    if comedy.empty:
+        print("\n[INFO] Brak komedii w tym zbiorze danych.")
+        return comedy
+
+    # Statystyki opisowe
+    print("\n=== Statystyki opisowe ocen komedii ===")
+    print(comedy["rating"].describe())
+
+    # Wykres histogramu
+    plt.figure(figsize=(6, 4))
+    sns.histplot(comedy["rating"], bins=5, discrete=True)
+    plt.title("Rozkład ocen komedii")
+    plt.xlabel("Ocena")
+    plt.ylabel("Liczba ocen")
+    plt.tight_layout()
+    plt.show()
+
+    return comedy
+
+
+def action_movies_stats(ratings: pd.DataFrame, movies: pd.DataFrame, top_n: int = 3) -> pd.DataFrame:
+
+    merged = ratings.merge(
+        movies[["movie_id", "title", "Action"]],
+        on="movie_id",
+        how="left"
+    )
+
+    action_ratings = merged[merged["Action"] == 1]
+
+    if action_ratings.empty:
+        print("\n[INFO] Brak filmów akcji w zbiorze danych.")
+        return pd.DataFrame()
+
+    mean_action_rating = action_ratings["rating"].mean()
+    print(f"\nŚrednia ocena wszystkich filmów akcji: {mean_action_rating:.4f}")
+
+    # Liczba ocen i średnia ocena dla każdego filmu akcji
+    agg = (
+        action_ratings
+        .groupby(["movie_id", "title"])
+        .agg(
+            n_ratings=("rating", "count"),
+            mean_rating=("rating", "mean")
+        )
+        .reset_index()
+    )
+
+    # Sortowanie: najpierw średnia ocena malejąco, potem liczba ocen malejąco
+    agg_sorted = agg.sort_values(
+        by=["mean_rating", "n_ratings"],
+        ascending=[False, False]
+    )
+
+    top_action = agg_sorted.head(top_n)
+
+    print(f"\nTop {top_n} najwyżej ocenianych filmów akcji:")
+    print(top_action)
+
+    return top_action
+
+# 3. PRZYGOTOWANIE DANYCH DLA surprise
+
+def build_surprise_dataset(ratings: pd.DataFrame) -> Dataset:
+
+    reader = Reader(rating_scale=(1, 5))
+    data = Dataset.load_from_df(
+        ratings[["user_id", "movie_id", "rating"]],
+        reader
+    )
+    return data
+
+
+# 4. TRENING MODELI: SVD i KNNWithMeans
+
+def train_svd(data: Dataset):
+
+    algo = SVD(random_state=RANDOM_STATE)
+
+    print("\n=== Walidacja krzyżowa SVD ===")
+    cv_results = cross_validate(
+        algo,
+        data,
+        measures=["RMSE", "MAE"],
+        cv=5,
+        verbose=True
+    )
+
+    # Średnie wyniki
+    mean_rmse = cv_results["test_rmse"].mean()
+    mean_mae = cv_results["test_mae"].mean()
+    print(f"\nŚredni RMSE (SVD): {mean_rmse:.4f}")
+    print(f"Średni MAE  (SVD): {mean_mae:.4f}")
+
+    # Dopasowanie na pełnym trainsecie
+    trainset = data.build_full_trainset()
+    algo.fit(trainset)
+
+    return algo, cv_results
+
+
+def train_knn_with_means_with_gridsearch(data: Dataset):
+
+    param_grid = {
+        "k": [2, 3, 4, 5, 6],
+        "sim_options": {
+            "name": ["pearson", "cosine"],
+            "user_based": [True, False]
+        }
+    }
+
+    print("\n=== GridSearchCV dla KNNWithMeans ===")
+    gs = GridSearchCV(
+        KNNWithMeans,
+        param_grid,
+        measures=["rmse", "mae"],
+        cv=5,
+        refit=True,
+        n_jobs=-1
+    )
+
+    gs.fit(data)
+
+    print("\nNajlepsze parametry (wg rmse):")
+    print(gs.best_params["rmse"])
+    print(f"Najlepszy RMSE: {gs.best_score['rmse']:.4f}")
+    print(f"Najlepszy MAE : {gs.best_score['mae']:.4f}")
+
+    # Wytrenowany najlepszy model (wg rmse)
+    best_algo = gs.best_estimator["rmse"]
+
+    return best_algo, gs
+
+
+# 6. PREFERENCJE UŻYTKOWNIKA I REKOMENDACJE
+
+def find_movie_ids_by_substring(movies: pd.DataFrame, title_substring: str) -> pd.DataFrame:
+
+    mask = movies["title"].str.contains(title_substring, case=False, regex=False, na=False)
+    return movies[mask][["movie_id", "title", "year"]]
+
+
+def inject_synthetic_user(
+    ratings: pd.DataFrame,
+    movies: pd.DataFrame,
+    fav_title_substrings,
+    synthetic_user_id: int = 999999,
+    synthetic_rating: float = 5.0
+):
+
+    ratings = ratings.copy()
+    chosen_movie_ids = []
+
+    for t in fav_title_substrings:
+        found = find_movie_ids_by_substring(movies, t)
+        if found.empty:
+            print(f"[WARN] Nie znaleziono żadnego filmu zawierającego '{t}' w tytule.")
+            continue
+
+        movie_id = int(found.iloc[0]["movie_id"])
+        title = str(found.iloc[0]["title"])
+        year = found.iloc[0]["year"]
+
+        print(f"Sztuczny użytkownik oceni film: movie_id={movie_id}, tytuł='{title}', rok={year}, ocena={synthetic_rating}")
+
+        new_row = {
+            "user_id": synthetic_user_id,
+            "movie_id": movie_id,
+            "rating": synthetic_rating,
+            "timestamp": 0
+        }
+        ratings = pd.concat([ratings, pd.DataFrame([new_row])], ignore_index=True)
+        chosen_movie_ids.append(movie_id)
+
+    if not chosen_movie_ids:
+        print("[WARN] Sztucznemu użytkownikowi nie przypisano żadnych filmów")
+
+    return ratings, chosen_movie_ids
+
+
+def recommend_for_user(
+    algo,
+    ratings: pd.DataFrame,
+    movies: pd.DataFrame,
+    user_id: int,
+    top_n: int = 10
+) -> pd.DataFrame:
+
+    user_rated_movie_ids = set(ratings.loc[ratings["user_id"] == user_id, "movie_id"].unique())
+    all_movie_ids = set(movies["movie_id"].unique())
+
+    candidates = list(all_movie_ids - user_rated_movie_ids)
+
+    predictions = []
+    for iid in candidates:
+        pred = algo.predict(uid=user_id, iid=iid)
+        predictions.append((iid, pred.est))
+
+    pred_df = pd.DataFrame(predictions, columns=["movie_id", "est_rating"])
+
+    pred_df = pred_df.merge(
+        movies[["movie_id", "title", "year"]],
+        on="movie_id",
+        how="left"
+    )
+
+    pred_df_sorted = pred_df.sort_values(by="est_rating", ascending=False).head(top_n)
+
+    print(f"\n=== Top {top_n} rekomendacji dla użytkownika {user_id} ===")
+    print(pred_df_sorted[["movie_id", "title", "year", "est_rating"]])
+
+    return pred_df_sorted
+
+
+def main():
+    data_dir = r"C:\Users\micha\OneDrive\Pulpit\studia\magisterka\uczenie maszynowe w finansach\ml-100k"  # <-- PODMIEŃ NA SWOJĄ ŚCIEŻKĘ
+
+    ratings_path = os.path.join(data_dir, "u.data")
+    items_path   = os.path.join(data_dir, "u.item")
+
+    #Wczytanie danych
+    ratings = load_ratings(ratings_path)
+    movies  = load_movies(items_path)
+
+    print("Rozmiar ratings:", ratings.shape)
+    print("Rozmiar movies :", movies.shape)
+
+    # Liczba filmów Sci-Fi
+    n_sci_fi = count_sci_fi_movies(movies)
+    print(f"\nLiczba filmów Sci-Fi: {n_sci_fi}")
+
+    #Rozkład ocen komedii
+    _ = comedy_distribution(ratings, movies)
+
+    #Średnia ocen filmów akcji + 3 najwyżej oceniane
+    top_action = action_movies_stats(ratings, movies, top_n=3)
+
+    #Przygotowanie danych dla surprise
+    data = build_surprise_dataset(ratings)
+
+    #Trening SVD
+    svd_model, svd_cv_results = train_svd(data)
+
+    #Trening KNNWithMeans z GridSearch
+    knn_model, knn_gs = train_knn_with_means_with_gridsearch(data)
+
+    #Wybór lepszego modelu na podstawie RMSE
+    svd_rmse_mean = svd_cv_results["test_rmse"].mean()
+    knn_rmse_best = knn_gs.best_score["rmse"]
+
+    if knn_rmse_best <= svd_rmse_mean:
+        print(f"\n=> KNNWithMeans ma lepszy (niższy) RMSE ({knn_rmse_best:.4f}) niż SVD ({svd_rmse_mean:.4f}).")
+        best_model = knn_model
+        best_model_name = "KNNWithMeans"
+    else:
+        print(f"\n=> SVD ma lepszy (niższy) RMSE ({svd_rmse_mean:.4f}) niż KNNWithMeans ({knn_rmse_best:.4f}).")
+        best_model = svd_model
+        best_model_name = "SVD"
+
+    print(f"Wybrany model do rekomendacji: {best_model_name}")
+
+    #Sztuczny użytkownik po obejrzeniu dwóch filmów
+
+    # Fragmenty tytułów, po których będziemy szukać filmów w zbiorze:
+    favorite_title_substrings = [
+        "Jumanji",
+        "Flint"
+    ]
+
+    synthetic_user_id = 999999
+
+    ratings_with_synth, rated_movie_ids = inject_synthetic_user(
+        ratings,
+        movies,
+        favorite_title_substrings,
+        synthetic_user_id,
+        synthetic_rating=5.0
+    )
+
+    if rated_movie_ids:
+        #Budujemy dataset i trenujemy wybrany model jeszcze raz z tym użytkownikiem
+        data_synth = build_surprise_dataset(ratings_with_synth)
+        trainset_synth = data_synth.build_full_trainset()
+        best_model.fit(trainset_synth)
+
+        #Rekomendacje dla sztucznego użytkownika
+        _ = recommend_for_user(
+            best_model,
+            ratings_with_synth,
+            movies,
+            user_id=synthetic_user_id,
+            top_n=10
+        )
+    else:
+        print("\n[INFO] Nie udało się przypisać sztucznemu użytkownikowi żadnego z zadanych filmów.")
+        print("Brak rekomendacji opartych na 'Jumanji' i 'Flint'.")
+
+
+
+main()
